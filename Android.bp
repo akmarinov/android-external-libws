@@ -2,12 +2,10 @@ cc_library_shared {
     name: "libws",
     vendor_available: true,
     local_include_dirs: ["."],
+    export_include_dirs: ["."],
     cflags: [
-        "-Wall",
-        "-Wextra",
-        "-std=c99",
-        "-O2",
-        "-pedantic",
+        "-Wall", "-Wextra", "-std=c99", "-O2", "-pedantic",
     ],
     srcs: ["*.c"],
+    stl: "none",
 }
