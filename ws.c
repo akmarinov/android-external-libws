@@ -30,8 +30,10 @@
 /* clang-format off */
 #ifndef _WIN32
 #include <arpa/inet.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #else
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -43,6 +45,12 @@ typedef int socklen_t;
 /* Windows and macOS seems to not have MSG_NOSIGNAL */
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
+#endif
+
+/* Windows does not have MSG_DONTWAIT (the lossy path uses blocking sends
+ * there, still bounded by WS_LOSSY_STALL_MS through select()). */
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0
 #endif
 
 #include <unistd.h>
@@ -57,6 +65,84 @@ typedef int socklen_t;
  * @file ws.c
  * @brief wsServer main routines.
  */
+
+/*
+ * Lossy (non-blocking) output path, see ws_sendframe_lossy().
+ *
+ * Clients that use it own an outbox: at most two frames (the one the sender
+ * thread is writing plus the newest one not started yet) and a sender thread
+ * that pushes them to the socket. Producers only copy the frame into the
+ * outbox - bounded work, never waiting on the network - so one slow client
+ * cannot stall whoever produces the frames. Whoever falls behind is reported
+ * back to the producer so it can, e.g., emit a key frame.
+ */
+
+/**
+ * @brief Written into ws_outbox.magic while its locks exist. Both values are
+ * reachable only through ws_outbox_prepare()/ws_outbox_teardown(), and the
+ * client array is memset(-1) at startup, so slot reuse can never mistake
+ * uninitialised memory for a live outbox.
+ */
+#define WS_OUTBOX_MAGIC 0x58424F55u
+#define WS_OUTBOX_IDLE 0x444C49u
+
+/**
+ * @brief Writability poll granularity while a frame is being written. A client
+ * that refuses data for WS_LOSSY_STALL_MS straight gets disconnected.
+ */
+#define WS_LOSSY_STALL_SLICE_MS 200
+
+/**
+ * @brief One frame held by an outbox: header and payload in a single buffer so
+ * the sender writes it with as few syscalls as possible.
+ */
+struct ws_outframe
+{
+	unsigned char *buf; /**< Frame header + payload.                 */
+	size_t alloc;       /**< Capacity of buf.                        */
+	size_t len;         /**< Bytes to write.                         */
+	size_t sent;        /**< Bytes already accepted by the socket.   */
+};
+
+/**
+ * @brief Outbox of one client, see above.
+ *
+ * 'wslot' is the slot producers fill; whenever the sender picks that frame up
+ * it flips to the other slot, which is why the sender always writes a slot no
+ * producer can touch and needs no lock while writing.
+ */
+struct ws_outbox
+{
+	uint32_t magic;        /**< WS_OUTBOX_MAGIC while usable.          */
+	pthread_mutex_t mtx;   /**< Guards everything below.               */
+	pthread_cond_t cnd;    /**< Signalled when a frame is queued.      */
+	pthread_t thread;      /**< Sender thread.                         */
+	bool started;          /**< Sender thread was created.             */
+	bool quit;             /**< Sender thread must stop.               */
+	bool dead;             /**< Socket unusable: stop queueing.        */
+	bool pending;          /**< slots[wslot] holds a queued frame.     */
+	unsigned wslot;        /**< Slot producers fill, 0 or 1.           */
+	int fd;                /**< Own dup of the socket, sender-owned.   */
+	struct ws_outframe slots[WS_LOSSY_QUEUE_DEPTH];
+};
+
+/* Lossy outbox routines, see ws_sendframe_lossy(). */
+static int ws_outbox_prepare(ws_cli_conn_t *client);
+static int ws_outbox_write(struct ws_outbox *ob, struct ws_outframe *frame);
+static void *ws_outbox_sender(void *arg);
+static void ws_outbox_teardown(ws_cli_conn_t *client);
+static int ws_outbox_enqueue(ws_cli_conn_t *client, const char *msg, size_t size,
+	int type, int *behind);
+
+/**
+ * @brief Guards the client table for the lossy send path.
+ *
+ * A separate lock on purpose: the legacy blocking path (ws_sendframe, ws_ping)
+ * holds the global mutex while it waits on send(), and the whole point of the
+ * lossy path is that its callers never wait behind that. The lossy mutex is
+ * only ever held around a table scan plus a memcpy, never around I/O.
+ */
+static pthread_mutex_t lossy_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * @brief Websocket events.
@@ -80,6 +166,9 @@ struct ws_connection
 	/* Send lock. */
 	pthread_mutex_t mtx_snd;
 
+	/* Lossy (non-blocking) outbox and its sender thread. */
+	struct ws_outbox outbox;
+
 	/* IP address. */
 	char ip[INET6_ADDRSTRLEN];
 
@@ -100,12 +189,32 @@ static struct ws_connection client_socks[MAX_CLIENTS];
 static uint32_t timeout;
 
 /**
+ * @brief Reads/writes the socket fd of a client.
+ *
+ * The fd is published by the accept loop and reset by close_client() while
+ * they hold the global mutex plus the lossy mutex, but a lot of code reads it
+ * with no lock at all (validity checks, send/recv, debug prints). Going
+ * through atomics keeps those readers from ever seeing a torn value and,
+ * together with the locking of every write, from using an fd number that was
+ * just closed and may already have been reopened for something else.
+ */
+static inline int cli_fd(ws_cli_conn_t *client)
+{
+	return (WS_CLI_FD(client));
+}
+
+static inline void cli_fd_set(ws_cli_conn_t *client, int fd)
+{
+	__atomic_store_n(&client->client_sock, fd, __ATOMIC_RELEASE);
+}
+
+/**
  * @brief Client validity macro
  */
 #define CLIENT_VALID(cli)                          \
 	((cli) != NULL && (cli) >= &client_socks[0] && \
 		(cli) <= &client_socks[MAX_CLIENTS - 1] && \
-		(cli)->client_sock > -1)
+		cli_fd(cli) > -1)
 
 /**
  * @brief WebSocket frame data
@@ -266,7 +375,7 @@ static ssize_t send_all(
 	pthread_mutex_lock(&client->mtx_snd);
 		while (len)
 		{
-			ret = send(client->client_sock, p, len, flags);
+			ret = send(cli_fd(client), p, len, flags);
 			if (ret == -1)
 			{
 				pthread_mutex_unlock(&client->mtx_snd);
@@ -292,18 +401,36 @@ static ssize_t send_all(
  */
 static void close_client(ws_cli_conn_t *client, int lock)
 {
+	int fd;
+
 	if (!CLIENT_VALID(client))
 		return;
 
 	set_client_state(client, WS_STATE_CLOSED);
 
-	close_socket(client->client_sock);
-
-	/* Destroy client mutexes and clear fd 'slot'. */
+	/*
+	 * Both mutexes, always in that order: the global one keeps the legacy
+	 * producers (which hold it across blocking sends) and the accept loop out
+	 * of the way, the lossy one excludes ws_sendframe_lossy(). No producer can
+	 * therefore be looking at - or dup()ing - this fd while it is closed, and
+	 * the slot cannot be handed to a new client before its locks are gone.
+	 * The join inside ws_outbox_teardown() is bounded by the sender's current
+	 * select() slice, as it already was for the legacy path.
+	 */
 	/* clang-format off */
 	if (lock)
 		pthread_mutex_lock(&mutex);
-			client->client_sock = -1;
+
+			pthread_mutex_lock(&lossy_mutex);
+				fd = cli_fd(client);
+				cli_fd_set(client, -1);
+
+				if (fd > -1)
+					close_socket(fd);
+
+				ws_outbox_teardown(client);
+			pthread_mutex_unlock(&lossy_mutex);
+
 			pthread_cond_destroy(&client->cnd_state_close);
 			pthread_mutex_destroy(&client->mtx_state);
 			pthread_mutex_destroy(&client->mtx_snd);
@@ -357,7 +484,7 @@ static void *close_timeout(void *p)
 	if (state == WS_STATE_CLOSED)
 		goto quit;
 
-	DEBUG("Timer expired, closing client %d\n", conn->client_sock);
+	DEBUG("Timer expired, closing client %d\n", cli_fd(conn));
 
 	close_client(conn, 1);
 quit:
@@ -400,6 +527,425 @@ out:
 }
 
 /**
+ * @brief Initialise the outbox of @p client on first use, so that clients that
+ * never use the lossy path pay nothing for it. Frame buffers of an earlier
+ * client of the same slot are kept when small enough, so streaming does not
+ * allocate on every frame.
+ *
+ * The client array is memset(-1) at startup and the magic values below are
+ * only ever written here and in ws_outbox_teardown(), so neither uninitialised
+ * nor retired memory can be mistaken for a usable outbox.
+ *
+ * Must be called with the lossy mutex held, which also excludes
+ * ws_outbox_teardown() for the very same slot.
+ *
+ * @return 0 when the outbox is usable, -1 otherwise.
+ *
+ * @attention This is part of the internal API and is documented just
+ * for completeness.
+ */
+static int ws_outbox_prepare(ws_cli_conn_t *client)
+{
+	struct ws_outbox *ob = &client->outbox;
+	unsigned i;
+
+	if (ob->magic == WS_OUTBOX_MAGIC)
+		return (0);
+
+	/* Anything but 'idle' means the memory was never initialised. */
+	if (ob->magic != WS_OUTBOX_IDLE)
+	{
+		for (i = 0; i < WS_LOSSY_QUEUE_DEPTH; i++)
+		{
+			ob->slots[i].buf = NULL;
+			ob->slots[i].alloc = 0;
+		}
+	}
+
+	if (pthread_mutex_init(&ob->mtx, NULL))
+		return (-1);
+	if (pthread_cond_init(&ob->cnd, NULL))
+	{
+		pthread_mutex_destroy(&ob->mtx);
+		return (-1);
+	}
+
+	ob->magic = WS_OUTBOX_MAGIC;
+	ob->started = false;
+	ob->quit = false;
+	ob->dead = false;
+	ob->pending = false;
+	ob->wslot = 0;
+	ob->fd = -1;
+
+	for (i = 0; i < WS_LOSSY_QUEUE_DEPTH; i++)
+	{
+		ob->slots[i].len = 0;
+		ob->slots[i].sent = 0;
+	}
+
+	return (0);
+}
+
+/**
+ * @brief Push one frame out of the outbox without ever spending more than
+ * WS_LOSSY_STALL_MS on it, however slowly the client drains.
+ *
+ * The budget is an absolute deadline, not a per-attempt timeout: a client that
+ * accepts a few bytes at a time is as useless for a live stream as one that
+ * accepts nothing, and it must not keep a frame open forever.
+ *
+ * @param ob    Outbox; ob->fd is read, the mutex is not held.
+ * @param frame Slot owned by the calling sender thread.
+ *
+ * @return 0 when the whole frame left, -1 if the socket is unusable or the
+ * client did not take the frame in time.
+ *
+ * @attention This is part of the internal API and is documented just
+ * for completeness.
+ */
+static int ws_outbox_write(struct ws_outbox *ob, struct ws_outframe *frame)
+{
+	const unsigned char *p;
+	struct timespec deadline;
+	size_t left;
+	ssize_t n;
+
+	p = frame->buf + frame->sent;
+	left = frame->len - frame->sent;
+
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	deadline.tv_sec += WS_LOSSY_STALL_MS / 1000;
+	deadline.tv_nsec += (long)(WS_LOSSY_STALL_MS % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L)
+	{
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+
+	while (left)
+	{
+		n = send(ob->fd, p, left, MSG_DONTWAIT | MSG_NOSIGNAL);
+
+		if (n > 0)
+		{
+			frame->sent += (size_t)n;
+			p += (size_t)n;
+			left -= (size_t)n;
+			continue;
+		}
+
+		if (n < 0 && errno == EINTR)
+			continue;
+
+		if (n < 0 && errno == EAGAIN)
+		{
+			struct timespec now;
+			fd_set wfds;
+			struct timeval tv;
+			long ms;
+			int ret;
+
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			ms = (long)(deadline.tv_sec - now.tv_sec) * 1000 +
+				(deadline.tv_nsec - now.tv_nsec) / 1000000L;
+			if (ms <= 0)
+				return (-1);
+			if (ms > WS_LOSSY_STALL_SLICE_MS)
+				ms = WS_LOSSY_STALL_SLICE_MS;
+
+			FD_ZERO(&wfds);
+			FD_SET(ob->fd, &wfds);
+
+			tv.tv_sec = ms / 1000;
+			tv.tv_usec = (ms % 1000) * 1000;
+
+			ret = select(ob->fd + 1, NULL, &wfds, NULL, &tv);
+			if (ret < 0 && errno != EINTR)
+				return (-1);
+
+			continue;
+		}
+
+		return (-1);
+	}
+
+	frame->sent = 0;
+	return (0);
+}
+
+/**
+ * @brief Sender thread of a client outbox: writes the newest queued frame to
+ * the socket until the connection dies or the client thread goes away.
+ *
+ * It always writes the slot the producers just stopped using, so the
+ * (potentially slow) write runs without holding the outbox lock.
+ *
+ * @param p ws_connection/ws_cli_conn_t structure pointer.
+ *
+ * @return Always NULL.
+ *
+ * @attention This is part of the internal API and is documented just
+ * for completeness.
+ */
+static void *ws_outbox_sender(void *p)
+{
+	ws_cli_conn_t *client = p;
+	struct ws_outbox *ob = &client->outbox;
+	struct ws_outframe *frame;
+	int fd;
+	int ret;
+
+	for (;;)
+	{
+		pthread_mutex_lock(&ob->mtx);
+
+		while (!ob->quit && !ob->pending)
+			pthread_cond_wait(&ob->cnd, &ob->mtx);
+
+		if (ob->quit)
+		{
+			fd = ob->fd;
+			ob->fd = -1;
+			pthread_mutex_unlock(&ob->mtx);
+
+			if (fd >= 0)
+				close_socket(fd);
+			break;
+		}
+
+		/* Take the pending frame, producers move to the other slot. */
+		frame = &ob->slots[ob->wslot];
+		ob->pending = false;
+		ob->wslot ^= 1u;
+
+		pthread_mutex_unlock(&ob->mtx);
+
+		/*
+		 * Legacy callers (ws_ping, ws_close_client, ws_sendframe) still write
+		 * this socket directly through send_all(), so both writers have to
+		 * hold the per-client send lock or control frames would interleave
+		 * with a video frame. Only the sender thread waits here, never a
+		 * producer.
+		 */
+		pthread_mutex_lock(&client->mtx_snd);
+		ret = ws_outbox_write(ob, frame);
+		pthread_mutex_unlock(&client->mtx_snd);
+
+		if (ret == 0)
+			continue;
+
+		/*
+		 * Unusable socket, or a client that stopped reading: a partially
+		 * written frame must never stay on the wire, so the connection is
+		 * dropped. Only our own socket reference is touched here - the
+		 * client thread owns the connection and tears it down as soon as
+		 * its blocked recv() sees the shutdown.
+		 */
+		DEBUG("Lossy send failed, dropping client %d\n", cli_fd(client));
+
+		pthread_mutex_lock(&ob->mtx);
+		ob->dead = true;
+		ob->pending = false;
+		if (ob->fd >= 0)
+		{
+			shutdown(ob->fd, SHUT_RDWR);
+			close(ob->fd);
+			ob->fd = -1;
+		}
+		pthread_mutex_unlock(&ob->mtx);
+
+		break;
+	}
+
+	return (NULL);
+}
+
+/**
+ * @brief Stop and reap the sender thread of @p client, then drop the outbox
+ * locks. Frame buffers small enough are kept for the next client of the slot.
+ *
+ * Must be called with the lossy mutex held and only once the connection is
+ * gone; close_client() is the only caller. Holding that mutex across the join
+ * is what makes this safe: producers are excluded so no frame buffer can be
+ * touched while it is freed, and the accept loop cannot claim the slot in the
+ * middle. The sender only ever takes its own outbox and send locks, never the
+ * mutex we hold, so the join cannot deadlock; it costs at most a select()
+ * slice plus, while a legacy sender owns the send lock, that send()'s timeout.
+ *
+ * @attention This is part of the internal API and is documented just
+ * for completeness.
+ */
+static void ws_outbox_teardown(ws_cli_conn_t *client)
+{
+	struct ws_outbox *ob = &client->outbox;
+	unsigned i;
+	bool joined;
+
+	if (ob->magic != WS_OUTBOX_MAGIC)
+		return;
+
+	pthread_mutex_lock(&ob->mtx);
+	joined = ob->started;
+	ob->quit = true;
+	ob->dead = true;
+
+	/*
+	 * shutdown() wakes both a select()-waiting sender and the client thread's
+	 * recv(). The fd itself is closed by the sender, never here, so it cannot
+	 * be closed under a running send().
+	 */
+	if (ob->fd >= 0)
+		shutdown(ob->fd, SHUT_RDWR);
+
+	pthread_cond_broadcast(&ob->cnd);
+	pthread_mutex_unlock(&ob->mtx);
+
+	if (joined)
+		pthread_join(ob->thread, NULL);
+
+	for (i = 0; i < WS_LOSSY_QUEUE_DEPTH; i++)
+	{
+		if (ob->slots[i].buf && ob->slots[i].alloc > WS_LOSSY_KEEP_ALLOC)
+		{
+			free(ob->slots[i].buf);
+			ob->slots[i].buf = NULL;
+			ob->slots[i].alloc = 0;
+		}
+		ob->slots[i].len = 0;
+		ob->slots[i].sent = 0;
+	}
+
+	ob->magic = WS_OUTBOX_IDLE;
+	ob->started = false;
+	ob->quit = false;
+	ob->dead = true;
+	ob->pending = false;
+	ob->wslot = 0;
+	ob->fd = -1;
+
+	pthread_cond_destroy(&ob->cnd);
+	pthread_mutex_destroy(&ob->mtx);
+}
+
+/**
+ * @brief Queue one lossy frame for @p client, copying it into the outbox.
+ *
+ * Never waits for the network: if the outbox still holds a frame the sender
+ * did not start, that frame is replaced by this one and @p behind is set.
+ *
+ * @return 1 when queued, 0 when the client cannot take it (gone), -1 on error.
+ *
+ * @attention This is part of the internal API and is documented just
+ * for completeness.
+ */
+static int ws_outbox_enqueue(ws_cli_conn_t *client, const char *msg, size_t size,
+	int type, int *behind)
+{
+	struct ws_outbox *ob = &client->outbox;
+	struct ws_outframe *slot;
+	unsigned char *nbuf;
+	unsigned char hdr[10];
+	size_t hdr_len;
+	size_t total;
+	uint64_t length;
+	int replaced;
+
+	length = (uint64_t)size;
+
+	hdr[0] = (unsigned char)(WS_FIN | type);
+
+	if (length <= 125)
+	{
+		hdr[1] = (unsigned char)(length & 0x7F);
+		hdr_len = 2;
+	}
+	else if (length <= 65535)
+	{
+		hdr[1] = 126;
+		hdr[2] = (unsigned char)((length >> 8) & 255);
+		hdr[3] = (unsigned char)(length & 255);
+		hdr_len = 4;
+	}
+	else
+	{
+		hdr[1] = 127;
+		hdr[2] = (unsigned char)((length >> 56) & 255);
+		hdr[3] = (unsigned char)((length >> 48) & 255);
+		hdr[4] = (unsigned char)((length >> 40) & 255);
+		hdr[5] = (unsigned char)((length >> 32) & 255);
+		hdr[6] = (unsigned char)((length >> 24) & 255);
+		hdr[7] = (unsigned char)((length >> 16) & 255);
+		hdr[8] = (unsigned char)((length >> 8) & 255);
+		hdr[9] = (unsigned char)(length & 255);
+		hdr_len = 10;
+	}
+
+	total = hdr_len + size;
+
+	pthread_mutex_lock(&ob->mtx);
+
+	if (ob->dead || ob->quit || cli_fd(client) < 0)
+	{
+		pthread_mutex_unlock(&ob->mtx);
+		return (0);
+	}
+
+	slot = &ob->slots[ob->wslot];
+
+	if (slot->alloc < total)
+	{
+		nbuf = realloc(slot->buf, total);
+		if (!nbuf)
+		{
+			pthread_mutex_unlock(&ob->mtx);
+			return (-1);
+		}
+		slot->buf = nbuf;
+		slot->alloc = total;
+	}
+
+	replaced = ob->pending ? 1 : 0;
+
+	memcpy(slot->buf, hdr, hdr_len);
+	memcpy(slot->buf + hdr_len, msg, size);
+	slot->len = total;
+	slot->sent = 0;
+	ob->pending = true;
+
+	if (!ob->started)
+	{
+		/*
+		 * Own reference to the socket: the client thread may close the
+		 * connection at any time and this dup keeps the sender's fd valid
+		 * until the sender is done with it.
+		 */
+		ob->fd = dup(cli_fd(client));
+		if (ob->fd < 0 || pthread_create(&ob->thread, NULL, ws_outbox_sender, client))
+		{
+			if (ob->fd >= 0)
+			{
+				close_socket(ob->fd);
+				ob->fd = -1;
+			}
+			ob->dead = true;
+			ob->pending = false;
+			pthread_mutex_unlock(&ob->mtx);
+			return (-1);
+		}
+		ob->started = true;
+	}
+
+	pthread_cond_signal(&ob->cnd);
+	pthread_mutex_unlock(&ob->mtx);
+
+	if (behind && replaced)
+		*behind = 1;
+
+	return (1);
+}
+
+/**
  * @brief Sets the IP address relative to a client connection opened
  * by the server and save inside the client structure.
  *
@@ -415,7 +961,7 @@ static void set_client_address(ws_cli_conn_t *client)
 
 	addr_size = sizeof(struct sockaddr_in);
 
-	if (getpeername(client->client_sock, (struct sockaddr *)&addr, &addr_size) < 0)
+	if (getpeername(cli_fd(client), (struct sockaddr *)&addr, &addr_size) < 0)
 		return;
 
 	memset(client->ip, 0, sizeof(client->ip));
@@ -537,7 +1083,7 @@ int ws_sendframe(ws_cli_conn_t *client, const char *msg, uint64_t size, int type
 		for (i = 0; i < MAX_CLIENTS; i++)
 		{
 			cli = &client_socks[i];
-			if ((cli->client_sock > -1) && get_client_state(cli) == WS_STATE_OPEN)
+			if ((cli_fd(cli) > -1) && get_client_state(cli) == WS_STATE_OPEN)
 			{
 				if ((send_ret = SEND(cli, response, idx_response)) != -1)
 					output += send_ret;
@@ -701,6 +1247,86 @@ int ws_sendframe_bin(ws_cli_conn_t *client, const char *msg, uint64_t size)
 }
 
 /**
+ * @brief Creates and queues a WebSocket frame without ever waiting for a
+ * client. See ws_sendframe_lossy() in the header for the semantics.
+ */
+int ws_sendframe_lossy(ws_cli_conn_t *client, const char *msg, uint64_t size,
+	int type, int *behind)
+{
+	ws_cli_conn_t *cli;
+	unsigned i;
+	int queued;
+	int ret;
+
+	if (behind)
+		*behind = 0;
+
+	if (!msg || size > WS_LOSSY_MAX_FRAME)
+		return (-1);
+
+	/*
+	 * The lossy mutex is held for the whole enqueue. It serialises us against
+	 * the accept loop filling slots and against close_client() retiring a
+	 * slot - including its sender thread - and, unlike the global mutex, it
+	 * is never held across a blocking send(), so a stalled legacy sender
+	 * cannot delay this caller. Enqueuing only copies and signals.
+	 */
+	pthread_mutex_lock(&lossy_mutex);
+
+	/* Single client. */
+	if (client)
+	{
+		if (!CLIENT_VALID(client) || get_client_state(client) != WS_STATE_OPEN)
+		{
+			pthread_mutex_unlock(&lossy_mutex);
+			return (-1);
+		}
+
+		if (ws_outbox_prepare(client) < 0)
+		{
+			pthread_mutex_unlock(&lossy_mutex);
+			return (-1);
+		}
+
+		ret = ws_outbox_enqueue(client, msg, (size_t)size, type, behind);
+
+		pthread_mutex_unlock(&lossy_mutex);
+
+		return (ret < 0 ? -1 : (ret ? 1 : 0));
+	}
+
+	/* Broadcast: enqueue per client, the caller never touches the sockets. */
+	queued = 0;
+
+	for (i = 0; i < MAX_CLIENTS; i++)
+	{
+		cli = &client_socks[i];
+
+		if (cli_fd(cli) < 0 || get_client_state(cli) != WS_STATE_OPEN)
+			continue;
+
+		if (ws_outbox_prepare(cli) < 0)
+			continue;
+
+		if (ws_outbox_enqueue(cli, msg, (size_t)size, type, behind) == 1)
+			queued++;
+	}
+
+	pthread_mutex_unlock(&lossy_mutex);
+
+	return (queued);
+}
+
+/**
+ * @brief Queues a WebSocket binary frame without ever waiting for a client.
+ */
+int ws_sendframe_bin_lossy(ws_cli_conn_t *client, const char *msg, uint64_t size,
+	int *behind)
+{
+	return ws_sendframe_lossy(client, msg, size, WS_FR_OP_BIN, behind);
+}
+
+/**
  * @brief For a given @p client, gets the current state for
  * the connection, or -1 if invalid.
  *
@@ -738,7 +1364,7 @@ int ws_close_client(ws_cli_conn_t *client)
 	int cc;
 
 	/* Check if client is a valid and connected client. */
-	if (!CLIENT_VALID(client) || client->client_sock == -1)
+	if (!CLIENT_VALID(client) || cli_fd(client) == -1)
 		return (-1);
 
 	/*
@@ -1054,7 +1680,7 @@ static int read_frame(struct ws_frame_data *wfd,
 	{
 		DEBUG("Current frame from client %d, exceeds the maximum\n"
 			  "amount of bytes allowed (%" PRId64 "/%d)!",
-			wfd->client->client_sock, *frame_size + *frame_length, MAX_FRAME_LENGTH);
+			cli_fd(wfd->client), *frame_size + *frame_length, MAX_FRAME_LENGTH);
 
 		wfd->error = 1;
 		return (-1);
@@ -1535,6 +2161,7 @@ static void *ws_accept(void *data)
 	int sock;                  /* Server sock.           */
 	int len;                   /* Length of sockaddr.    */
 	int i;                     /* Loop index.            */
+	int on = 1;
 
 	sock = *(int *)data;
 	len = sizeof(struct sockaddr_in);
@@ -1543,6 +2170,25 @@ static void *ws_accept(void *data)
 	{
 		/* Accept. */
 		new_sock = accept(sock, (struct sockaddr *)&client, (socklen_t *)&len);
+
+		if (new_sock < 0)
+			panic("Error on accepting connections..");
+
+		/*
+		 * Streaming frames must leave immediately instead of waiting for
+		 * more data to coalesce, and a short unsent queue is what makes a
+		 * stalled client show up as EAGAIN early instead of after
+		 * megabytes of kernel buffering.
+		 */
+		setsockopt(new_sock, IPPROTO_TCP, TCP_NODELAY, (char *)&on, sizeof(on));
+
+#ifdef TCP_NOTSENT_LOWAT
+		{
+			int lowat = WS_LOSSY_NOTSENT_LOWAT;
+			setsockopt(new_sock, SOL_SOCKET, TCP_NOTSENT_LOWAT, &lowat,
+				sizeof(lowat));
+		}
+#endif
 
 		if (timeout)
 		{
@@ -1561,22 +2207,18 @@ static void *ws_accept(void *data)
 				sizeof(struct timeval));
 		}
 
-		if (new_sock < 0)
-			panic("Error on accepting connections..");
-
-		/* Adds client socket to socks list. */
+		/*
+		 * Adding the client needs both mutexes, in the usual order: readers
+		 * that only take the lossy one (ws_sendframe_lossy scanning the table)
+		 * must never see a slot whose locks do not exist yet, which is also
+		 * why the fd is published last.
+		 */
 		pthread_mutex_lock(&mutex);
+		pthread_mutex_lock(&lossy_mutex);
 		for (i = 0; i < MAX_CLIENTS; i++)
 		{
-			if (client_socks[i].client_sock == -1)
+			if (cli_fd(&client_socks[i]) == -1)
 			{
-				client_socks[i].client_sock = new_sock;
-				client_socks[i].state = WS_STATE_CONNECTING;
-				client_socks[i].close_thrd = false;
-				client_socks[i].last_pong_id = -1;
-				client_socks[i].current_ping_id = -1;
-				set_client_address(&client_socks[i]);
-
 				if (pthread_mutex_init(&client_socks[i].mtx_state, NULL))
 					panic("Error on allocating close mutex");
 				if (pthread_cond_init(&client_socks[i].cnd_state_close, NULL))
@@ -1585,9 +2227,36 @@ static void *ws_accept(void *data)
 					panic("Error on allocating send mutex");
 				if (pthread_mutex_init(&client_socks[i].mtx_ping, NULL))
 					panic("Error on allocating ping/pong mutex");
+
+				client_socks[i].state = WS_STATE_CONNECTING;
+				client_socks[i].close_thrd = false;
+				client_socks[i].last_pong_id = -1;
+				client_socks[i].current_ping_id = -1;
+
+				/*
+				 * The client table is memset(-1) at startup, so on a slot that
+				 * never had an outbox the frame buffers are garbage rather
+				 * than NULL. Clear them (and mark the outbox retired, which
+				 * lets ws_outbox_prepare() reuse them) here, where the slot is
+				 * initialised; one entry per WS_LOSSY_QUEUE_DEPTH slot.
+				 */
+				client_socks[i].outbox.magic = WS_OUTBOX_IDLE;
+				client_socks[i].outbox.slots[0].buf = NULL;
+				client_socks[i].outbox.slots[1].buf = NULL;
+				client_socks[i].outbox.slots[0].alloc = 0;
+				client_socks[i].outbox.slots[1].alloc = 0;
+
+				/*
+				 * Publish the fd last: nothing above this point may be
+				 * missing once another thread can reach the slot through it.
+				 * The owning client thread starts after both mutexes release.
+				 */
+				cli_fd_set(&client_socks[i], new_sock);
+				set_client_address(&client_socks[i]);
 				break;
 			}
 		}
+		pthread_mutex_unlock(&lossy_mutex);
 		pthread_mutex_unlock(&mutex);
 
 		/* Client socket added to socks list ? */

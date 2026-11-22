@@ -216,12 +216,57 @@ extern "C" {
 	#endif
 	/**@}*/
 
+	/**
+	 * @name Lossy output (see ws_sendframe_lossy)
+	 */
+	/**@{*/
+	/**
+	 * @brief Largest payload a single lossy frame may carry. Bigger frames
+	 * are rejected instead of buffered.
+	 */
+	#define WS_LOSSY_MAX_FRAME (2 * 1024 * 1024)
+
+	/**
+	 * @brief Outbox depth: one frame held by the sender thread while it
+	 * writes, plus one holding the newest frame not yet started.
+	 */
+	#define WS_LOSSY_QUEUE_DEPTH 2
+
+	/**
+	 * @brief Outbox frame buffers up to this size survive a disconnect and
+	 * are reused by the next client of the same slot, so that streaming does
+	 * not allocate on every frame.
+	 */
+	#define WS_LOSSY_KEEP_ALLOC (512 * 1024)
+
+	/**
+	 * @brief How long (ms) a client may keep refusing data before its
+	 * connection is aborted.
+	 */
+	#define WS_LOSSY_STALL_MS 5000
+
+	/**
+	 * @brief Send threshold used for TCP_NOTSENT_LOWAT when available.
+	 */
+	#define WS_LOSSY_NOTSENT_LOWAT (32 * 1024)
+	/**@}*/
+
+	/**
+	 * @brief Reads the socket fd of a client.
+	 *
+	 * The fd is published and reset only under the library locks, but it is
+	 * read from several threads without any (validity checks, send/recv), so
+	 * the access is atomic: a reader can then never see a half-written value.
+	 */
+	#define WS_CLI_FD(client) \
+		__atomic_load_n(&(client)->client_sock, __ATOMIC_ACQUIRE)
+
 	#ifndef AFL_FUZZ
 	#define SEND(client,buf,len) send_all((client), (buf), (len), MSG_NOSIGNAL)
-	#define RECV(fd,buf,len) recv((fd)->client_sock, (buf), (len), 0)
+	#define RECV(fd,buf,len) recv(WS_CLI_FD(fd), (buf), (len), 0)
 	#else
 	#define SEND(client,buf,len) write(fileno(stdout), (buf), (len))
-	#define RECV(fd,buf,len) read((fd)->client_sock, (buf), (len))
+	#define RECV(fd,buf,len) read(WS_CLI_FD(fd), (buf), (len))
 	#endif
 
 	/* Opaque client connection type. */
@@ -262,6 +307,36 @@ extern "C" {
 		ws_cli_conn_t *cli, const char *msg, uint64_t size, int type);
 	extern int ws_sendframe_txt(ws_cli_conn_t *cli, const char *msg);
 	extern int ws_sendframe_bin(ws_cli_conn_t *cli, const char *msg, uint64_t size);
+
+	/*
+	 * Lossy, non-blocking send for latency sensitive streams (video, audio).
+	 *
+	 * The frame is copied into a one-slot outbox per client and written by a
+	 * per-client sender thread, so the caller never waits on a slow client.
+	 * If a client still has a frame queued, the queued frame is replaced by
+	 * the new one (the newest frame always wins) and @p behind, when given,
+	 * is set to 1 so the caller can react - e.g. force the next H.264 frame
+	 * to be a key frame.
+	 *
+	 * A client that stops accepting data for WS_LOSSY_STALL_MS, or whose
+	 * socket errors mid-frame, is disconnected: partial frames never stay on
+	 * the wire. As the outbox keeps only the newest frame, a client can miss
+	 * frames in normal operation, which is why the caller is told about it.
+	 *
+	 * @param cli    Client to send to; NULL broadcasts to all open clients.
+	 * @param msg    Payload, copied before returning.
+	 * @param size   Payload size, at most WS_LOSSY_MAX_FRAME.
+	 * @param type   Frame opcode, e.g. WS_FR_OP_BIN.
+	 * @param behind Optional out flag, cleared by the callee.
+	 *
+	 * @return The number of clients the frame was queued for, 0 if there is
+	 * nobody to send to, or -1 on error (invalid client, oversized frame or
+	 * out of memory).
+	 */
+	extern int ws_sendframe_lossy(ws_cli_conn_t *cli, const char *msg, uint64_t size,
+		int type, int *behind);
+	extern int ws_sendframe_bin_lossy(ws_cli_conn_t *cli, const char *msg, uint64_t size,
+		int *behind);
 	extern int ws_get_state(ws_cli_conn_t *cli);
 	extern int ws_close_client(ws_cli_conn_t *cli);
 	extern int ws_socket(struct ws_events *evs, uint16_t port, int thread_loop,
